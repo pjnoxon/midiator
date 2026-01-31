@@ -1,0 +1,208 @@
+Target code from Launch Pad
+changed to 2422 pin assignments
+
+/*
+ * MSP-EXP430FR2433 UART Transmitter Program (Polling Version)
+ *
+ * This version uses a polling loop for button state checking and implements
+ * software debouncing using Timer A0. Interrupts are disabled.
+ *
+ * 1. Clock: DCO=2MHz, MCLK=1MHz, SMCLK=1MHz (Default).
+ * 2. UART Baud Rate: 31,250 bps (using 1 MHz SMCLK, UCBRW=32).
+ * 3. Timer A0: Implements a single 5-second wait and a 20ms debouncing wait.
+ * 4. Button Logic (Active Low, Pull-ups):
+ * - STOP (P2.3=Hi, P2.7=Hi): Sends [180, 85, 64]
+ * - SLOW (P2.3=Hi, P2.7=Low): Sends [180, 85, 63]
+ * - FAST (P2.3=Low, P2.7=Hi): Sends [180, 85, 65]
+ *
+ * NOTE: Timer peripherals are correctly set to Timer A0 (TA0).
+ */
+
+#include <msp430.h>
+
+// Enumeration for button states
+typedef enum {
+    MODE_STOP = 64,
+    MODE_SLOW = 63,
+    MODE_FAST = 65
+} Mode;
+
+// Function prototypes
+void UART_send_packet(unsigned char byte3);
+void timer_wait_5s(void);
+void timer_wait_20ms(void);
+Mode get_current_mode(void);
+
+
+void main(void)
+{
+    Mode previous_mode = MODE_STOP;
+    Mode new_mode;
+
+    // Stop watchdog timer
+    WDTCTL = WDTPW | WDTHOLD;
+
+    // =========================================================================
+    // 1. Clock System Configuration (Using System Defaults - SMCLK = 1 MHz)
+    // =========================================================================
+    __bis_SR_register(SCG0); // Disable global interrupts during clock config
+    __bic_SR_register(SCG0); // Re-enable interrupts
+
+   // =========================================================================
+   // 2. GPIO Configuration (Logic Gates and UART)
+   // =========================================================================
+
+   // 2a. Configure Logic Gate Inputs S1 (P1.0) and S2 (P1.1) - NO Internal Resistors
+   P1DIR &= ~(BIT0 | BIT1); // Set P1.0 and P1.1 as inputs
+   P1REN &= ~(BIT0 | BIT1); // **DISABLE pull-up/pull-down resistors (rely on external logic gates)**
+   P1OUT &= ~(BIT0 | BIT1); // Clean slate
+   P1IFG = 0;               // Clear all P1 interrupt flags
+
+   // 2b. Configure UART Pins (P2.0 Tx, P2.1 Rx) for eUSCI_A0
+   P2SEL0 |= (BIT0 | BIT1); // P2.0/P2.1 for UCA0TXD/UCA0RXD
+   P2SEL1 &= ~(BIT0 | BIT1);
+
+   // 2c. Configure other specified pins as inputs with PULL-UPS
+   // P2.2
+   P2DIR &= ~BIT2;
+   P2REN |= BIT2;
+   P2OUT |= BIT2; // Pull-up
+
+   // P1.7, P1.6, P1.5, P1.4, P1.3, P1.2
+   #define P1_PULLUP_MASK (BIT7 | BIT6 | BIT5 | BIT4 | BIT3 | BIT2)
+   P1DIR &= ~P1_PULLUP_MASK; // Input
+   P1REN |= P1_PULLUP_MASK;  // Enable resistors
+   P1OUT |= P1_PULLUP_MASK;  // Pull-up
+
+   // Disable the unused pins to save power
+   PM5CTL0 &= ~LOCKLPM5;
+
+    // =========================================================================
+    // 3. eUSCI_A0 (UART) Configuration (Using 1 MHz SMCLK)
+    // =========================================================================
+    UCA0CTLW0 |= UCSWRST;         // Put eUSCI in reset for configuration
+    UCA0CTLW0 |= UCSSEL__SMCLK;   // Select SMCLK as source (1 MHz default)
+    UCA0BRW = 32;                 // Integer division factor for 31,250 bps
+    UCA0MCTLW = 0x0000;           // No modulation
+    UCA0CTLW0 &= ~UCSWRST;        // Initialize eUSCI (release from reset)
+
+    // =========================================================================
+    // 4. Initial 5-Second Wait & Main Loop
+    // =========================================================================
+    timer_wait_5s();
+
+    // Start polling loop (no low power mode is used since we are actively polling)
+    while(1)
+    {
+        // 1. Read the current unsettled mode (State A)
+        new_mode = get_current_mode();
+
+        // 2. Check for a potential state change
+        if (new_mode != previous_mode)
+        {
+            // 3. Wait 20ms to debounce
+            timer_wait_20ms();
+
+            // 4. Read the state again (State B)
+            Mode settled_mode = get_current_mode();
+
+            // 5. If the state is still different (change settled)
+            if (settled_mode != previous_mode)
+            {
+                // Send the UART message corresponding to the new mode
+                UART_send_packet((unsigned char)settled_mode);
+
+                // Update the stored mode
+                previous_mode = settled_mode;
+            }
+        }
+        // Small delay to prevent constantly hammering the CPU/Timer
+        timer_wait_20ms();
+    }
+}
+
+/**
+ * @brief Reads the state of P1.0 (S1) and P1.1 (S2) and returns the defined Mode.
+ * Logic is preserved: BIT set (High) is the condition check.
+ */
+Mode get_current_mode(void)
+{
+    unsigned int p1_state = P1IN;
+    unsigned int s1_state = p1_state & BIT0; // P1.0 state
+    unsigned int s2_state = p1_state & BIT1; // P1.1 state
+
+    // STOP: Both bits set (High)
+    if (s1_state && s2_state) {
+        return MODE_STOP; // 64
+    }
+    // SLOW: S1 High (Released) AND S2 Low (Pressed) - based on original button mapping
+    else if (s1_state && !s2_state) {
+        return MODE_SLOW; // 63
+    }
+    // FAST: S1 Low (Pressed) AND S2 High (Released) - based on original button mapping
+    else if (!s1_state && s2_state) {
+        return MODE_FAST; // 65
+    }
+
+    // Default to STOP
+    return MODE_STOP;
+}
+
+/**
+ * @brief Sends a 3-byte packet over the UART (eUSCI_A0).
+ */
+void UART_send_packet(unsigned char byte3)
+{
+    unsigned char packet[] = {180, 85, byte3};
+
+    while (!(UCA0IFG & UCTXIFG));
+    UCA0TXBUF = packet[0];
+    while (!(UCA0IFG & UCTXIFG));
+    UCA0TXBUF = packet[1];
+    while (!(UCA0IFG & UCTXIFG));
+    UCA0TXBUF = packet[2];
+}
+
+/**
+ * @brief Blocks execution for exactly 5.0 seconds using Timer A0.
+ *
+ * Uses SMCLK (1 MHz) divided by 64 (15,625 Hz). Ticks needed: 78,125.
+ */
+void timer_wait_5s(void)
+{
+    // Configure TA0: SMCLK / 64 (ID=3, IDEX=7) -> 15625 Hz
+    TA0CTL = TASSEL_2 | MC__STOP | TACLR | ID_3;
+    TA0EX0 = TAIDEX_7;
+
+    // First count: 65536 ticks
+    TA0CCR0 = 65536 - 1;
+    TA0CTL |= MC__UP;
+    while (!(TA0CCTL0 & CCIFG)); // Check CCIFG in TA0CCTL0
+    TA0CCTL0 &= ~CCIFG;            // Clear CCIFG
+
+    // Second count: remaining 12589 ticks
+    TA0CCR0 = 12589 - 1;
+    TA0CTL |= MC__UP;
+    while (!(TA0CCTL0 & CCIFG)); // Check CCIFG in TA0CCTL0
+
+    // Ensure timer is completely stopped and reset
+    TA0CTL = MC__STOP | TACLR;
+}
+
+/**
+ * @brief Blocks execution for exactly 20 milliseconds using Timer A0.
+ *
+ * Uses SMCLK (1 MHz) divided by 1 (1,000,000 Hz). Ticks needed: 20,000.
+ */
+void timer_wait_20ms(void)
+{
+    // Configure TA0 to use SMCLK / 1 -> 1 MHz
+    TA0CTL = TASSEL_2 | MC__STOP | TACLR;
+
+    TA0CCR0 = 20000 - 1;
+    TA0CTL |= MC__UP;
+    while (!(TA0CCTL0 & CCIFG)); // Check CCIFG in TA0CCTL0
+
+    // Ensure timer is completely stopped and reset
+    TA0CTL = MC__STOP | TACLR;
+}
